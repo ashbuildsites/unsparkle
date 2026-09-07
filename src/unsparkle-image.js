@@ -73,29 +73,9 @@
     return { a: a, evidence: r1 > 0.5 ? r0 / r1 : 0, resid: r1 };
   }
 
-  /*
-   * Gemini uses a few different watermark sizes and margins depending on the
-   * output. Score each known placement against the real pixels and keep the
-   * most convincing - still a handful of spots, never a whole-image search.
-   */
+  /* Same bounded corner search the video path uses, in full-range sRGB. */
   function locate(gray, w, h) {
-    var cands = Core.geometryCandidates(w, h), best = null;
-    for (var ci = 0; ci < cands.length; ci++) {
-      var g = cands[ci];
-      for (var dn = -6; dn <= 6; dn += 2) {
-        var n = g.n + dn; if (n < 16 || n > Math.min(w, h)) continue;
-        var m = matteN(n);
-        for (var dx = -6; dx <= 6; dx++) for (var dy = -6; dy <= 6; dy++) {
-          var X = g.x0 + dx, Y = g.y0 + dy;
-          if (X < 0 || Y < 0 || X + n > w || Y + n > h) continue;
-          var r = fit(gray, w, h, X, Y, n, m);
-          if (r.a < MIN_ALPHA || r.a > MAX_ALPHA) continue;
-          if (!best || r.evidence > best.evidence)
-            best = { x0: X, y0: Y, n: n, alpha: r.a, evidence: r.evidence };
-        }
-      }
-    }
-    return best;
+    return Core.locateCorner(gray, w, h, w, 255);
   }
 
   async function process(file, opts) {
@@ -124,7 +104,8 @@
     report(60, "cleaning");
     var before = cand.alpha;
     Core.unblendRGBA(img.data, w, h,
-                     { geom: { x0: cand.x0, y0: cand.y0, n: cand.n } });
+                     { geom: { x0: cand.x0, y0: cand.y0, n: cand.n },
+                       alpha: cand.alpha });
     ctx.putImageData(img, 0, 0);
     var after = fit(toGray(img.data, w, h), w, h,
                     cand.x0, cand.y0, cand.n, matteN(cand.n)).a;

@@ -24,19 +24,24 @@
   // Canvas gives full-range sRGB, where the same mark measures a touch lower.
   var ALPHA_RGB = 0.2975, WHITE_RGB = 255.0;
   /*
-   * Gemini does not use one watermark geometry - it picks from a small
-   * catalogue based on the output size. The first entry here was measured
-   * directly (480 video frames at 720x1280, then confirmed on a 1408x768
-   * still with a 9.6x residual drop). The others are the configurations
-   * documented by the upstream open-source project for other output sizes.
+   * The mark scales with the SHORTER side of the frame, not with width and
+   * not as a fixed badge. Measured:
    *
-   * Every candidate is scored against the actual pixels and the best one
-   * wins, so an unfamiliar output is handled rather than silently missed.
+   *    720x1280   76px  inset 80/84    (0.106 of min side)
+   *    1408x768   76px  inset 80/84    (0.099)
+   *    848x478    50px  inset 52/56    (0.105)
+   *
+   * A fixed geometry was wrong: on 848x478 it corrected empty pixels and
+   * punched a dark star into clean footage while leaving the real watermark
+   * untouched. So the ratios below are only a starting point - the corner is
+   * searched around them and the fit has to earn its place before anything is
+   * modified.
    */
+  var SIZE_RATIO = 0.104, RIGHT_RATIO = 0.108, BOTTOM_RATIO = 0.115;
   var CONFIGS = [
-    { n: 76, right: 80, bottom: 84 },   // measured here
-    { n: 96, right: 64, bottom: 64 },   // larger Gemini outputs
-    { n: 48, right: 32, bottom: 32 }    // smaller Gemini outputs
+    { n: 76, right: 80, bottom: 84 },
+    { n: 96, right: 64, bottom: 64 },
+    { n: 48, right: 32, bottom: 32 }
   ];
   var INSET_RIGHT = CONFIGS[0].right, INSET_BOTTOM = CONFIGS[0].bottom;
 
@@ -74,9 +79,16 @@
   /* Every plausible placement for this frame size, best-known first. */
   function geometryCandidates(w, h) {
     var out = [];
+    var mn = Math.min(w, h);
+    var scaled = { n: Math.round(mn * SIZE_RATIO) & ~1,
+                   right: Math.round(mn * RIGHT_RATIO),
+                   bottom: Math.round(mn * BOTTOM_RATIO) };
+    var g0 = placeConfig(scaled, w, h);
+    if (g0) out.push(g0);
     for (var i = 0; i < CONFIGS.length; i++) {
       var g = placeConfig(CONFIGS[i], w, h);
-      if (g) out.push(g);
+      if (g && !out.some(function (o) {
+            return o.n === g.n && o.x0 === g.x0 && o.y0 === g.y0; })) out.push(g);
     }
     if (!out.length) {
       var n = Math.max(8, Math.min(REF_N, Math.min(w, h) - 2));
@@ -157,13 +169,14 @@
   }
 
   /* NV12 keeps U and V interleaved in one plane at half resolution. */
-  function unblendUVInterleaved(plane, stride, x0, y0, n, cov) {
+  function unblendUVInterleaved(plane, stride, x0, y0, n, cov, k) {
+    k = k || 1;
     for (var y = 0; y < n; y++) {
       var row = (y0 + y) * stride + x0 * 2, mrow = y * n;
       for (var x = 0; x < n; x++) {
         var c = cov[mrow + x];
         if (c <= 0) continue;
-        var au = ALPHA.u * c, av = ALPHA.v * c;
+        var au = ALPHA.u * k * c, av = ALPHA.v * k * c;
         var iu = row + x * 2, iv = iu + 1;
         var u = (plane[iu] - au * WHITE.u) / (1 - au);
         var v = (plane[iv] - av * WHITE.v) / (1 - av);
@@ -181,18 +194,26 @@
   function unblendFrame(buf, fmt, layout, w, h, opts) {
     var g = (opts && opts.geom) || geometry(w, h);
     var n = g.n, m = matteAt(n), mc = matteChroma(m, n);
+    /*
+     * The opacity constant stays fixed at the measured 0.2962. Substituting a
+     * per-file estimate was tried and reverted: a residual sweep showed 0.2962
+     * beats every higher value at every candidate size, and the single-frame
+     * estimate is noisier than the constant fitted over 480 frames. Where a
+     * ghost remains it is the mark's SIZE that is slightly off, or the source
+     * is simply too compressed to recover cleanly.
+     */
+    var k = 1;
     var cx = g.x0 >> 1, cy = g.y0 >> 1, cn = n >> 1;
     var yStride = layout[0].stride, Y = buf.subarray(layout[0].offset);
-    unblendPlane(Y, yStride, g.x0, g.y0, n, m, ALPHA.y, WHITE.y);
+    unblendPlane(Y, yStride, g.x0, g.y0, n, m, ALPHA.y * k, WHITE.y);
     if (!opts || opts.repair !== false) repairRim(Y, yStride, g.x0, g.y0, n, m, 12);
 
     if (fmt === "NV12" || fmt === "NV21") {
       var uv = buf.subarray(layout[1].offset);
-      unblendUVInterleaved(uv, layout[1].stride, cx, cy, cn,
-                           fmt === "NV12" ? mc : mc);
+      unblendUVInterleaved(uv, layout[1].stride, cx, cy, cn, mc, k);
     } else if (layout.length >= 3) {
-      unblendPlane(buf.subarray(layout[1].offset), layout[1].stride, cx, cy, cn, mc, ALPHA.u, WHITE.u);
-      unblendPlane(buf.subarray(layout[2].offset), layout[2].stride, cx, cy, cn, mc, ALPHA.v, WHITE.v);
+      unblendPlane(buf.subarray(layout[1].offset), layout[1].stride, cx, cy, cn, mc, ALPHA.u * k, WHITE.u);
+      unblendPlane(buf.subarray(layout[2].offset), layout[2].stride, cx, cy, cn, mc, ALPHA.v * k, WHITE.v);
     }
     return g;
   }
@@ -243,11 +264,12 @@
     var g = (opts && opts.geom) || geometry(w, h);
     var n = g.n, m = matteAt(n), a, i, x, y, c;
     var safe = g.x0 > 0 && g.y0 > 0 && g.x0 + n < w && g.y0 + n < h;
+    var aBase = ALPHA_RGB;
     for (y = 0; y < n; y++) {
       for (x = 0; x < n; x++) {
         c = m[y * n + x];
         if (c <= 0) continue;
-        a = ALPHA_RGB * c;
+        a = aBase * c;
         i = ((g.y0 + y) * w + (g.x0 + x)) * 4;
         for (var k = 0; k < 3; k++) {
           var v = (data[i + k] - a * WHITE_RGB) / (1 - a);
@@ -300,7 +322,111 @@
     return den > 1e-6 ? num / den : 0;
   }
 
+  /*
+   * Fit the blend at one placement and report how much better "a sparkle is
+   * here" explains the pixels than "nothing is here". Shared by video and
+   * images so both gate on the same evidence.
+   */
+  function fitAt(Y, w, h, stride, x0, y0, n, m, white) {
+    var C = white === undefined ? WHITE.y : white;
+    var s1 = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0, sz = 0, sxz = 0, syz = 0;
+    var x, y, val;
+    for (y = 0; y < n; y++) for (x = 0; x < n; x++) {
+      if (m[y * n + x] > 0.01) continue;
+      val = Y[(y0 + y) * stride + x0 + x];
+      s1++; sx += x; sy += y; sxx += x * x; sxy += x * y; syy += y * y;
+      sz += val; sxz += x * val; syz += y * val;
+    }
+    if (s1 < 20) return { a: 0, evidence: 0 };
+    var A = [[s1, sx, sy], [sx, sxx, sxy], [sy, sxy, syy]], B = [sz, sxz, syz], i, j, k;
+    for (i = 0; i < 3; i++) {
+      var piv = A[i][i]; if (Math.abs(piv) < 1e-9) return { a: 0, evidence: 0 };
+      for (j = i; j < 3; j++) A[i][j] /= piv; B[i] /= piv;
+      for (k = 0; k < 3; k++) if (k !== i) {
+        var f = A[k][i];
+        for (j = i; j < 3; j++) A[k][j] -= f * A[i][j];
+        B[k] -= f * B[i];
+      }
+    }
+    var num = 0, den = 0;
+    for (y = 0; y < n; y++) for (x = 0; x < n; x++) {
+      var cov = m[y * n + x]; if (cov <= 0) continue;
+      var base = B[0] + B[1] * x + B[2] * y;
+      num += cov * (C - base) * (Y[(y0 + y) * stride + x0 + x] - base);
+      den += cov * cov * (C - base) * (C - base);
+    }
+    if (den < 1e-6) return { a: 0, evidence: 0 };
+    var a = num / den, r0 = 0, r1 = 0, cnt = 0;
+    for (y = 0; y < n; y++) for (x = 0; x < n; x++) {
+      var c2 = m[y * n + x]; if (c2 <= 0) continue;
+      var b2 = B[0] + B[1] * x + B[2] * y;
+      var o2 = Y[(y0 + y) * stride + x0 + x];
+      var d0 = o2 - b2, d1 = o2 - (b2 + a * c2 * (C - b2));
+      r0 += d0 * d0; r1 += d1 * d1; cnt++;
+    }
+    r0 = Math.sqrt(r0 / cnt); r1 = Math.sqrt(r1 / cnt);
+    return { a: a, evidence: r1 > 0.5 ? r0 / r1 : 0, resid: r1 };
+  }
+
+  /*
+   * Search the bottom-right corner for the mark. Bounded to that corner and to
+   * plausible sizes - never a whole-frame hunt, which produced convincing
+   * false positives when it was tried.
+   */
+  function locateCorner(Y, w, h, stride, white) {
+    stride = stride || w;
+    var mn = Math.min(w, h), best = null, si, dr, db;
+    var base = Math.round(mn * SIZE_RATIO);
+
+    // Coarse: a few plausible sizes, positions on a wide step.
+    var sizes = [];
+    for (si = -8; si <= 8; si += 4) {
+      var n = (base + si) & ~1;
+      if (n >= 16 && n < mn / 2 && sizes.indexOf(n) < 0) sizes.push(n);
+    }
+    [76, 96, 48].forEach(function (n) {
+      if (n < mn / 2 && sizes.indexOf(n) < 0) sizes.push(n);
+    });
+
+    var rMid = Math.round(mn * RIGHT_RATIO), bMid = Math.round(mn * BOTTOM_RATIO);
+    var span = Math.max(12, Math.round(mn * 0.05));
+    for (si = 0; si < sizes.length; si++) {
+      var nn = sizes[si], m = matteAt(nn);
+      for (dr = -span; dr <= span; dr += 4) {
+        var x0 = w - (rMid + dr) - nn;
+        if (x0 < 0 || x0 + nn > w) continue;
+        for (db = -span; db <= span; db += 4) {
+          var y0 = h - (bMid + db) - nn;
+          if (y0 < 0 || y0 + nn > h) continue;
+          var r = fitAt(Y, w, h, stride, x0, y0, nn, m, white);
+          if (r.a < 0.12 || r.a > 0.60) continue;
+          if (!best || r.evidence > best.evidence)
+            best = { x0: x0, y0: y0, n: nn, alpha: r.a, evidence: r.evidence };
+        }
+      }
+    }
+    if (!best) return null;
+
+    // Fine: walk size and position one step at a time around the winner.
+    var refined = best;
+    for (var dn = -4; dn <= 4; dn += 2) {
+      var n2 = best.n + dn; if (n2 < 16 || n2 >= mn) continue;
+      var m2 = matteAt(n2);
+      for (var dx = -4; dx <= 4; dx++) for (var dy = -4; dy <= 4; dy++) {
+        var X = best.x0 + dx, Yy = best.y0 + dy;
+        if (X < 0 || Yy < 0 || X + n2 > w || Yy + n2 > h) continue;
+        var rr = fitAt(Y, w, h, stride, X, Yy, n2, m2, white);
+        if (rr.a < 0.12 || rr.a > 0.60) continue;
+        if (rr.evidence > refined.evidence)
+          refined = { x0: X, y0: Yy, n: n2, alpha: rr.a, evidence: rr.evidence };
+      }
+    }
+    return refined;
+  }
+
   global.UnsparkleCore = {
+    fitAt: fitAt, locateCorner: locateCorner,
+    SIZE_RATIO: SIZE_RATIO, MIN_EVIDENCE: 2.6,
     ALPHA: ALPHA, WHITE: WHITE, ALPHA_RGB: ALPHA_RGB,
     REF: {w: REF_W, h: REF_H, n: REF_N, insetRight: INSET_RIGHT, insetBottom: INSET_BOTTOM},
     geometry: geometry, geometryCandidates: geometryCandidates, CONFIGS: CONFIGS,
