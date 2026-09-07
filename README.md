@@ -80,6 +80,37 @@ an unfamiliar output is handled rather than silently missed.
 - **It reports its own work.** The same estimator that finds the watermark
   measures the result: `~0.30` before, `~0.00` after, shown per file.
 
+## Measured against a re-encoding remover
+
+Removing the watermark is the easy half. The half nobody measures is what the
+tool does to the rest of the frame on the way out. Same 10-second Gemini clip,
+same machine:
+
+| | Output size | Fidelity outside the patch* | Watermark gone |
+| :--- | :--- | :--- | :--- |
+| Original | 10.06 MB | — | — |
+| A re-encoding remover | 4.07 MB (40%) | **30.5 dB** | yes |
+| **unsparkle** | 5.60 MB (56%) | **43.9 dB** | yes |
+
+On a second clip: **28.1 dB vs 45.6 dB**, and the re-encoding tool left the
+watermark visibly intact across part of the timeline while reporting success.
+
+\* Luma PSNR against the original, measured only *outside* the watermark
+patch, so it scores what the tool did to everything else. ~30 dB is where
+compression artifacts start showing on detailed material; the mid-40s is
+visually indistinguishable.
+
+Do not take our word for it — [`bench/compare.py`](bench/compare.py) runs the
+measurement on any two outputs:
+
+```bash
+./bench/compare.py original.mp4 candidate-a.mp4 candidate-b.mp4
+```
+
+It reports size, PSNR outside the patch, and the measured watermark opacity
+per candidate — so "did it actually work" and "what did it cost" are both
+numbers rather than claims.
+
 ## Use it
 
 ### Online (recommended)
