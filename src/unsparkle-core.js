@@ -406,12 +406,18 @@
     // Gemini or Veo output falls outside it.
     var lo = Math.max(16, Math.round(mn * 0.04));
     var hi = Math.max(lo + 2, Math.round(mn * 0.16));
-    var step = Math.max(2, Math.round((hi - lo) / 9)) & ~1 || 2;
+    var step = Math.max(2, Math.round((hi - lo) / 14)) & ~1 || 2;
     var sizes = [];
     for (si = lo; si <= hi; si += step) {
       var n0 = si & ~1;
       if (sizes.indexOf(n0) < 0) sizes.push(n0);
     }
+    // 76 and 50 are the sizes actually observed in the wild; make sure the
+    // ladder cannot step over them.
+    [76, 50].forEach(function (n) {
+      if (n >= lo && n <= hi && sizes.indexOf(n) < 0) sizes.push(n);
+    });
+    sizes.sort(function (a, b) { return a - b; });
 
     // Positions: sweep the corner rather than trusting a fixed inset.
     var maxInset = Math.round(mn * 0.22), posStep = Math.max(3, Math.round(mn * 0.012));
@@ -441,15 +447,20 @@
      * otherwise-removed sparkle. Covering the whole mark matters more than
      * the last few percent of fit.
      */
-    var tol = best.evidence * 0.85, grow = best;
+    var tol = best.evidence * 0.9, grow = best;
+    var cx = best.x0 + best.n / 2, cy = best.y0 + best.n / 2;
     for (si = 0; si < sizes.length; si++) {
       var ng = sizes[si];
-      if (ng <= grow.n) continue;
+      if (ng <= grow.n || ng > best.n * 1.6) continue;
       var mg = matteAt(ng);
-      for (dr = 0; dr <= maxInset; dr += posStep) {
-        var gx = w - dr - ng; if (gx < 0) continue;
-        for (db = 0; db <= maxInset; db += posStep) {
-          var gy = h - db - ng; if (gy < 0) continue;
+      // Concentric only. Letting this roam turned a weak fit somewhere else
+      // entirely into the "winner" - it must answer "is the same mark bigger
+      // than I thought", not "is there a bigger mark anywhere".
+      var lim = Math.max(3, Math.round(ng * 0.18));
+      for (var gx = Math.round(cx - ng / 2) - lim; gx <= Math.round(cx - ng / 2) + lim; gx += 2) {
+        if (gx < 0 || gx + ng > w) continue;
+        for (var gy = Math.round(cy - ng / 2) - lim; gy <= Math.round(cy - ng / 2) + lim; gy += 2) {
+          if (gy < 0 || gy + ng > h) continue;
           var rg = fitAt(Y, w, h, stride, gx, gy, ng, mg, white);
           if (rg.a < 0.10 || rg.a > 0.80) continue;
           if (rg.evidence >= tol && ng > grow.n)
@@ -535,7 +546,15 @@
 
   global.UnsparkleCore = {
     fitAt: fitAt, locateCorner: locateCorner, refineAlpha: refineAlpha,
-    SIZE_RATIO: SIZE_RATIO, MIN_EVIDENCE: 2.6,
+    SIZE_RATIO: SIZE_RATIO, /*
+     * Below this, the file is left alone.
+     *
+     * Set by the two cases that matter: an already-cleaned video scores 3.3
+     * (the rim ringing we leave behind reads as a faint mark), and the
+     * weakest genuine watermark seen scores 4.9. Running the tool twice must
+     * be safe, so the line sits between them.
+     */
+    MIN_EVIDENCE: 4.0,
     ALPHA: ALPHA, WHITE: WHITE, ALPHA_RGB: ALPHA_RGB,
     REF: {w: REF_W, h: REF_H, n: REF_N, insetRight: INSET_RIGHT, insetBottom: INSET_BOTTOM},
     geometry: geometry, geometryCandidates: geometryCandidates, CONFIGS: CONFIGS,

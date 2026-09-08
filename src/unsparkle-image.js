@@ -15,7 +15,16 @@
   "use strict";
   var Core = global.UnsparkleCore;
 
-  var MIN_EVIDENCE = 3.0;    // how much better "a sparkle is here" must fit
+  /*
+   * How much better "a sparkle is here" must explain the patch than "nothing
+   * is here" before anything is touched.
+   *
+   * Raised from 3.0 after widening the search: with more placements to try,
+   * the best meaningless fit also scores higher. Three clean images all came
+   * back at 3.12-3.13, which put the old floor squarely in the noise. A
+   * genuine mark scores far above this - the confirmed one measures 9.6.
+   */
+  var MIN_EVIDENCE = 4.5;
   var MIN_ALPHA = 0.15, MAX_ALPHA = 0.55;
 
   function toGray(data, w, h) {

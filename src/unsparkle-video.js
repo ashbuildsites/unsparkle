@@ -187,21 +187,32 @@
       return Math.abs(r.n - best.n) <= 6 &&
              Math.abs(r.x0 - best.x0) <= 8 && Math.abs(r.y0 - best.y0) <= 8;
     });
-    if (near.length) {
-      /*
-       * Deliberately conservative: the lower third of the per-frame fits
-       * rather than the median.
-       *
-       * The two failure modes are not symmetric. Under-correcting leaves a
-       * faint ghost that most people never notice; over-correcting subtracts
-       * white that was never there and leaves a dark star-shaped smudge,
-       * which is worse than not running the tool at all. Weighting by
-       * contrast was tried first and measured worse.
-       */
-      var keep = near.map(function (r) { return r.alpha; })
-                     .sort(function (a, b) { return a - b; });
+    /*
+     * Choose the opacity, but only from frames where it can be measured.
+     *
+     * The estimate divides by (white - background), so over a pale background
+     * it is close to dividing by nothing. One clip whose mark sits on cream
+     * fabric fitted an opacity high enough to gouge a dark hole in the frame.
+     * Frames without real contrast are discarded, and if none survive the
+     * measured constant is used instead of a guess.
+     *
+     * Among the frames that do qualify, the lower third is taken rather than
+     * the median. The two failure modes are not symmetric: under-correcting
+     * leaves a faint ghost most people never notice, over-correcting leaves a
+     * dark star-shaped smudge that is worse than not running the tool at all.
+     */
+    var MIN_CONTRAST = 45;
+    var usable = near.filter(function (r) { return (r.contrast || 0) >= MIN_CONTRAST; });
+    if (usable.length) {
+      var keep = usable.map(function (r) { return r.alpha; })
+                       .sort(function (a, b) { return a - b; });
       best.alpha = keep[Math.floor(keep.length / 3)];
+    } else {
+      best.alpha = Core.ALPHA.y;          // too little contrast to measure
+      best.lowContrast = true;
     }
+    if (best.alpha < 0.15) best.alpha = 0.15;
+    if (best.alpha > 0.75) best.alpha = 0.75;
     best.samples = results.length;
     best.agreed = near.length;
     return best;
@@ -234,7 +245,16 @@
     var muxCfg = {
       target: target,
       video: { codec: "avc", width: W, height: H },
-      fastStart: "in-memory"
+      fastStart: "in-memory",
+      /*
+       * Not every clip starts at timestamp zero - B-frame reordering can put
+       * the first sample at, say, DTS 0.083. The muxer rejects that outright,
+       * and because the rejection happens inside the encoder's output
+       * callback it was swallowed, surfacing as the useless "produced no
+       * frames". Shifting all timestamps so the first is zero is exactly what
+       * the muxer offers for this.
+       */
+      firstTimestampBehavior: "offset"
     };
     if (d.audio) {
       muxCfg.audio = {
@@ -328,8 +348,13 @@
 
     var encoder = new VideoEncoder({
       output: function (chunk, meta) {
-        muxer.addVideoChunk(chunk, meta || undefined);
-        encoded++;
+        // Anything thrown in here is invisible to the caller, so catch it.
+        try {
+          muxer.addVideoChunk(chunk, meta || undefined);
+          encoded++;
+        } catch (e) {
+          if (!codecError) codecError = new Error("muxer: " + (e && e.message ? e.message : e));
+        }
       },
       error: noteError("encoder")
     });
@@ -346,7 +371,8 @@
     } else {
       geom = { x0: hit.x0 & ~1, y0: hit.y0 & ~1, n: hit.n, scale: 1 };
       detection = { found: true, evidence: hit.evidence, alpha: hit.alpha,
-                    samples: hit.samples, agreed: hit.agreed };
+                    samples: hit.samples, agreed: hit.agreed,
+                    lowContrast: !!hit.lowContrast };
     }
 
     /*
@@ -458,12 +484,17 @@
               sampleRate: d.audio.audio.sample_rate,
               description: d.audioDesc } }
         : undefined;
-      for (var j = 0; j < d.aSamples.length; j++) {
-        var a = d.aSamples[j];
-        muxer.addAudioChunkRaw(
-          a.data, a.is_sync ? "key" : "delta",
-          1e6 * a.cts / a.timescale, 1e6 * a.duration / a.timescale,
-          j === 0 ? meta : undefined);
+      try {
+        for (var j = 0; j < d.aSamples.length; j++) {
+          var a = d.aSamples[j];
+          muxer.addAudioChunkRaw(
+            a.data, a.is_sync ? "key" : "delta",
+            1e6 * a.cts / a.timescale, 1e6 * a.duration / a.timescale,
+            j === 0 ? meta : undefined);
+        }
+      } catch (e) {
+        // Losing the audio track is far better than losing the whole export.
+        report(94, "muxing");
       }
     }
 
@@ -478,7 +509,10 @@
         width: W, height: H, frames: processed, encodedChunks: encoded,
         fps: fps, inSize: file.size, outSize: blob.size,
         sourceBps: srcBps, bitrate: bitrateFor(W, H, fps, opts.quality || 16, srcBps),
-        alphaBefore: firstAlpha, alphaAfter: lastAlpha,
+        // 0 rather than null when nothing was found, so callers can format
+        // these without a special case.
+        alphaBefore: firstAlpha === null ? 0 : firstAlpha,
+        alphaAfter: lastAlpha === null ? 0 : lastAlpha,
         hasAudio: !!(d.audio && d.aSamples.length),
         found: !!(detection && detection.found),
         evidence: detection ? detection.evidence : 0,
