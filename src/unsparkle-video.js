@@ -112,9 +112,9 @@
      * complete extra decode, which made a 10s clip take 10s instead of 1s.
      */
     var samples = d.vSamples, picks = [], i;
-    var horizon = Math.min(samples.length, 36);
-    var stride = Math.max(1, Math.floor(horizon / (wanted || 4)));
-    for (i = 0; i < horizon && picks.length < (wanted || 4); i += stride) picks.push(i);
+    var horizon = Math.min(samples.length, 120);
+    var stride = Math.max(1, Math.floor(horizon / (wanted || 7)));
+    for (i = 0; i < horizon && picks.length < (wanted || 7); i += stride) picks.push(i);
     if (!picks.length) picks = [0];
 
     var results = [], buf = null, seen = 0, want = {};
@@ -132,9 +132,14 @@
             if (!buf || buf.length < frame.allocationSize())
               buf = new Uint8Array(frame.allocationSize());
             var layout = await frame.copyTo(buf);
-            var hit = Core.locateCorner(buf.subarray(layout[0].offset), W, H,
-                                        layout[0].stride, Core.WHITE.y);
-            if (hit) results.push(hit);
+            var yp = buf.subarray(layout[0].offset);
+            var hit = Core.locateCorner(yp, W, H, layout[0].stride, Core.WHITE.y);
+            if (hit) {
+              // residual-minimising opacity, not the biased analytic one
+              hit.alpha = Core.refineAlpha(yp, W, H, layout[0].stride, hit,
+                                           Core.WHITE.y, hit.alpha);
+              results.push(hit);
+            }
           } catch (e) { /* a frame we cannot read tells us nothing */ }
           finally { frame.close(); }
         });
@@ -164,12 +169,41 @@
     try { dec.close(); } catch (e) {}
     if (!results.length) return null;
 
-    // Group by placement and keep the one that fits best across frames.
+    /*
+     * Keep the strongest placement, then choose the opacity from the frames
+     * where it can actually be measured.
+     *
+     * The estimate divides by (white - background), so a bright background
+     * makes it unreliable: on one clip the same constant mark read 0.43 over
+     * a mid-grey wall and 0.04 over a bright one. Ranking frames by contrast
+     * and taking the median of the better half avoids being dragged around by
+     * the frames that had nothing to measure against.
+     */
     var best = null;
     for (i = 0; i < results.length; i++) {
-      var r = results[i];
-      if (!best || r.evidence > best.evidence) best = r;
+      if (!best || results[i].evidence > best.evidence) best = results[i];
     }
+    var near = results.filter(function (r) {
+      return Math.abs(r.n - best.n) <= 6 &&
+             Math.abs(r.x0 - best.x0) <= 8 && Math.abs(r.y0 - best.y0) <= 8;
+    });
+    if (near.length) {
+      /*
+       * Deliberately conservative: the lower third of the per-frame fits
+       * rather than the median.
+       *
+       * The two failure modes are not symmetric. Under-correcting leaves a
+       * faint ghost that most people never notice; over-correcting subtracts
+       * white that was never there and leaves a dark star-shaped smudge,
+       * which is worse than not running the tool at all. Weighting by
+       * contrast was tried first and measured worse.
+       */
+      var keep = near.map(function (r) { return r.alpha; })
+                     .sort(function (a, b) { return a - b; });
+      best.alpha = keep[Math.floor(keep.length / 3)];
+    }
+    best.samples = results.length;
+    best.agreed = near.length;
     return best;
   }
 
@@ -305,13 +339,14 @@
     var processed = 0;
 
     report(10, "checking");
-    var hit = await detectGeometry(d, W, H, 4);
+    var hit = await detectGeometry(d, W, H, 7);
     if (!hit || hit.evidence < Core.MIN_EVIDENCE) {
       detection = { found: false, evidence: hit ? hit.evidence : 0 };
       geom = false;                             // nothing convincing: leave it alone
     } else {
       geom = { x0: hit.x0 & ~1, y0: hit.y0 & ~1, n: hit.n, scale: 1 };
-      detection = { found: true, evidence: hit.evidence, alpha: hit.alpha };
+      detection = { found: true, evidence: hit.evidence, alpha: hit.alpha,
+                    samples: hit.samples, agreed: hit.agreed };
     }
 
     /*
@@ -447,6 +482,7 @@
         hasAudio: !!(d.audio && d.aSamples.length),
         found: !!(detection && detection.found),
         evidence: detection ? detection.evidence : 0,
+        alpha: detection ? detection.alpha : 0,
         encoderConfig: encCfg.codec + " / " + encCfg.latencyMode + " / " + encCfg.hardwareAcceleration,
         geom: (geom && geom !== false) ? geom : Core.geometry(W, H)
       }

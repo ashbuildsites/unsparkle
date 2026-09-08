@@ -91,7 +91,8 @@
     var img = ctx.getImageData(0, 0, w, h);
 
     report(30, "checking");
-    var cand = locate(toGray(img.data, w, h), w, h);
+    var gray = toGray(img.data, w, h);
+    var cand = locate(gray, w, h);
     if (!cand || cand.evidence < MIN_EVIDENCE) {
       return {
         found: false, width: w, height: h,
@@ -102,6 +103,7 @@
     }
 
     report(60, "cleaning");
+    cand.alpha = Core.refineAlpha(gray, w, h, w, cand, 255, cand.alpha);
     var before = cand.alpha;
     Core.unblendRGBA(img.data, w, h,
                      { geom: { x0: cand.x0, y0: cand.y0, n: cand.n },

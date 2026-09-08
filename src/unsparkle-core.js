@@ -195,14 +195,20 @@
     var g = (opts && opts.geom) || geometry(w, h);
     var n = g.n, m = matteAt(n), mc = matteChroma(m, n);
     /*
-     * The opacity constant stays fixed at the measured 0.2962. Substituting a
-     * per-file estimate was tried and reverted: a residual sweep showed 0.2962
-     * beats every higher value at every candidate size, and the single-frame
-     * estimate is noisier than the constant fitted over 480 frames. Where a
-     * ghost remains it is the mark's SIZE that is slightly off, or the source
-     * is simply too compressed to recover cleanly.
+     * Opacity is fitted per file, then scaled onto the per-plane constants.
+     *
+     * A single fixed value cannot work: measured marks run from ~0.30 on
+     * 720x1280 Gemini output to ~0.59 on a 1080x1920 Veo clip. An earlier
+     * attempt used a single frame's estimate and was reverted for being
+     * noisy - this uses the median across sampled frames instead, which is
+     * stable on the clips the constant already handled and correct on the
+     * ones it did not.
      */
     var k = 1;
+    if (opts && opts.alpha > 0) {
+      k = opts.alpha / ALPHA.y;
+      if (k < 0.6) k = 0.6; else if (k > 2.4) k = 2.4;
+    }
     var cx = g.x0 >> 1, cy = g.y0 >> 1, cn = n >> 1;
     var yStride = layout[0].stride, Y = buf.subarray(layout[0].offset);
     unblendPlane(Y, yStride, g.x0, g.y0, n, m, ALPHA.y * k, WHITE.y);
@@ -264,7 +270,9 @@
     var g = (opts && opts.geom) || geometry(w, h);
     var n = g.n, m = matteAt(n), a, i, x, y, c;
     var safe = g.x0 > 0 && g.y0 > 0 && g.x0 + n < w && g.y0 + n < h;
-    var aBase = ALPHA_RGB;
+    var aBase = (opts && opts.alpha > 0)
+      ? Math.max(ALPHA_RGB * 0.6, Math.min(ALPHA_RGB * 2.4, opts.alpha))
+      : ALPHA_RGB;
     for (y = 0; y < n; y++) {
       for (x = 0; x < n; x++) {
         c = m[y * n + x];
@@ -365,7 +373,12 @@
       r0 += d0 * d0; r1 += d1 * d1; cnt++;
     }
     r0 = Math.sqrt(r0 / cnt); r1 = Math.sqrt(r1 / cnt);
-    return { a: a, evidence: r1 > 0.5 ? r0 / r1 : 0, resid: r1 };
+    // The mean background under the mark. The opacity estimate divides by
+    // (C - background), so a bright background makes it unreliable - callers
+    // use this to weight frames rather than trusting them equally.
+    var bg = s1 ? sz / s1 : 0;
+    return { a: a, evidence: r1 > 0.5 ? r0 / r1 : 0, resid: r1,
+             bg: bg, contrast: Math.abs(C - bg) };
   }
 
   /*
@@ -373,59 +386,155 @@
    * plausible sizes - never a whole-frame hunt, which produced convincing
    * false positives when it was tried.
    */
+  /*
+   * Find the sparkle at any resolution.
+   *
+   * Nothing here is pinned to a resolution or a constant. The corner is swept
+   * across a wide range of sizes; at each placement the opacity that best
+   * explains the pixels is solved for analytically, and the winner is the fit
+   * that beats "nothing is here" by the widest margin.
+   *
+   * Both halves have to be fitted, because both genuinely vary: a 1080x1920
+   * Veo clip carries a mark at opacity ~0.59 where a 720x1280 Gemini clip is
+   * ~0.30. Assuming either one produced a visible leftover on the other.
+   */
   function locateCorner(Y, w, h, stride, white) {
     stride = stride || w;
     var mn = Math.min(w, h), best = null, si, dr, db;
-    var base = Math.round(mn * SIZE_RATIO);
 
-    // Coarse: a few plausible sizes, positions on a wide step.
+    // Sizes from 4% to 16% of the shorter side - wide enough that no known
+    // Gemini or Veo output falls outside it.
+    var lo = Math.max(16, Math.round(mn * 0.04));
+    var hi = Math.max(lo + 2, Math.round(mn * 0.16));
+    var step = Math.max(2, Math.round((hi - lo) / 9)) & ~1 || 2;
     var sizes = [];
-    for (si = -8; si <= 8; si += 4) {
-      var n = (base + si) & ~1;
-      if (n >= 16 && n < mn / 2 && sizes.indexOf(n) < 0) sizes.push(n);
+    for (si = lo; si <= hi; si += step) {
+      var n0 = si & ~1;
+      if (sizes.indexOf(n0) < 0) sizes.push(n0);
     }
-    [76, 96, 48].forEach(function (n) {
-      if (n < mn / 2 && sizes.indexOf(n) < 0) sizes.push(n);
-    });
 
-    var rMid = Math.round(mn * RIGHT_RATIO), bMid = Math.round(mn * BOTTOM_RATIO);
-    var span = Math.max(12, Math.round(mn * 0.05));
+    // Positions: sweep the corner rather than trusting a fixed inset.
+    var maxInset = Math.round(mn * 0.22), posStep = Math.max(3, Math.round(mn * 0.012));
     for (si = 0; si < sizes.length; si++) {
-      var nn = sizes[si], m = matteAt(nn);
-      for (dr = -span; dr <= span; dr += 4) {
-        var x0 = w - (rMid + dr) - nn;
-        if (x0 < 0 || x0 + nn > w) continue;
-        for (db = -span; db <= span; db += 4) {
-          var y0 = h - (bMid + db) - nn;
-          if (y0 < 0 || y0 + nn > h) continue;
+      var nn = sizes[si]; if (nn >= mn * 0.5) continue;
+      var m = matteAt(nn);
+      for (dr = 0; dr <= maxInset; dr += posStep) {
+        var x0 = w - dr - nn; if (x0 < 0) continue;
+        for (db = 0; db <= maxInset; db += posStep) {
+          var y0 = h - db - nn; if (y0 < 0) continue;
           var r = fitAt(Y, w, h, stride, x0, y0, nn, m, white);
-          if (r.a < 0.12 || r.a > 0.60) continue;
+          if (r.a < 0.10 || r.a > 0.80) continue;
           if (!best || r.evidence > best.evidence)
-            best = { x0: x0, y0: y0, n: nn, alpha: r.a, evidence: r.evidence };
+            best = { x0: x0, y0: y0, n: nn, alpha: r.a, evidence: r.evidence,
+                     resid: r.resid, bg: r.bg, contrast: r.contrast };
         }
       }
     }
     if (!best) return null;
 
-    // Fine: walk size and position one step at a time around the winner.
-    var refined = best;
-    for (var dn = -4; dn <= 4; dn += 2) {
-      var n2 = best.n + dn; if (n2 < 16 || n2 >= mn) continue;
-      var m2 = matteAt(n2);
-      for (var dx = -4; dx <= 4; dx++) for (var dy = -4; dy <= 4; dy++) {
-        var X = best.x0 + dx, Yy = best.y0 + dy;
-        if (X < 0 || Yy < 0 || X + n2 > w || Yy + n2 > h) continue;
-        var rr = fitAt(Y, w, h, stride, X, Yy, n2, m2, white);
-        if (rr.a < 0.12 || rr.a > 0.60) continue;
-        if (rr.evidence > refined.evidence)
-          refined = { x0: X, y0: Yy, n: n2, alpha: rr.a, evidence: rr.evidence };
+    /*
+     * Prefer the largest size that fits almost as well as the winner.
+     *
+     * Evidence quietly favours an UNDERSIZED matte: a small patch sitting
+     * inside the mark's solid core fits beautifully and scores high, while
+     * leaving the rim uncorrected - which showed up as a bright arc around an
+     * otherwise-removed sparkle. Covering the whole mark matters more than
+     * the last few percent of fit.
+     */
+    var tol = best.evidence * 0.85, grow = best;
+    for (si = 0; si < sizes.length; si++) {
+      var ng = sizes[si];
+      if (ng <= grow.n) continue;
+      var mg = matteAt(ng);
+      for (dr = 0; dr <= maxInset; dr += posStep) {
+        var gx = w - dr - ng; if (gx < 0) continue;
+        for (db = 0; db <= maxInset; db += posStep) {
+          var gy = h - db - ng; if (gy < 0) continue;
+          var rg = fitAt(Y, w, h, stride, gx, gy, ng, mg, white);
+          if (rg.a < 0.10 || rg.a > 0.80) continue;
+          if (rg.evidence >= tol && ng > grow.n)
+            grow = { x0: gx, y0: gy, n: ng, alpha: rg.a, evidence: rg.evidence,
+                     resid: rg.resid, bg: rg.bg, contrast: rg.contrast };
+        }
+      }
+    }
+    best = grow;
+
+    // Tighten size and position one pixel at a time around the winner.
+    var refined = best, pass, span, sstep;
+    for (pass = 0; pass < 2; pass++) {
+      span = pass === 0 ? posStep : 2;
+      sstep = pass === 0 ? Math.max(2, step >> 1) : 1;
+      var c = refined;
+      for (var dn = -step; dn <= step; dn += sstep) {
+        var n2 = c.n + dn; if (n2 < 16 || n2 >= mn * 0.5) continue;
+        var m2 = matteAt(n2);
+        for (var dx = -span; dx <= span; dx++) for (var dy = -span; dy <= span; dy++) {
+          var X = c.x0 + dx, Yy = c.y0 + dy;
+          if (X < 0 || Yy < 0 || X + n2 > w || Yy + n2 > h) continue;
+          var rr = fitAt(Y, w, h, stride, X, Yy, n2, m2, white);
+          if (rr.a < 0.10 || rr.a > 0.80) continue;
+          if (rr.evidence > refined.evidence)
+            refined = { x0: X, y0: Yy, n: n2, alpha: rr.a, evidence: rr.evidence,
+                        resid: rr.resid, bg: rr.bg, contrast: rr.contrast };
+        }
       }
     }
     return refined;
   }
 
+  /*
+   * Choose the opacity that leaves the least behind.
+   *
+   * The analytic solve inside fitAt returns the least-squares opacity for a
+   * given placement, but it is biased whenever the matte size is even
+   * slightly off - on one clip it read 0.356 where 0.30 was correct, and
+   * over-corrected into a dark smudge. Sweeping the actual post-correction
+   * residual is unbiased by construction, because it scores the thing we
+   * actually care about.
+   */
+  function refineAlpha(Y, w, h, stride, geom, white, seed) {
+    var C = white === undefined ? WHITE.y : white;
+    var n = geom.n, m = matteAt(n), x0 = geom.x0, y0 = geom.y0;
+    var s1 = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0, sz = 0, sxz = 0, syz = 0;
+    var x, y, val;
+    for (y = 0; y < n; y++) for (x = 0; x < n; x++) {
+      if (m[y * n + x] > 0.01) continue;
+      val = Y[(y0 + y) * stride + x0 + x];
+      s1++; sx += x; sy += y; sxx += x * x; sxy += x * y; syy += y * y;
+      sz += val; sxz += x * val; syz += y * val;
+    }
+    if (s1 < 20) return seed || ALPHA.y;
+    var A = [[s1, sx, sy], [sx, sxx, sxy], [sy, sxy, syy]], B = [sz, sxz, syz], i, j, k;
+    for (i = 0; i < 3; i++) {
+      var piv = A[i][i]; if (Math.abs(piv) < 1e-9) return seed || ALPHA.y;
+      for (j = i; j < 3; j++) A[i][j] /= piv; B[i] /= piv;
+      for (k = 0; k < 3; k++) if (k !== i) {
+        var f = A[k][i];
+        for (j = i; j < 3; j++) A[k][j] -= f * A[i][j];
+        B[k] -= f * B[i];
+      }
+    }
+    var bestA = seed || ALPHA.y, bestR = Infinity;
+    for (var a = 0.14; a <= 0.78; a += 0.01) {
+      var acc = 0, cnt = 0;
+      for (y = 0; y < n; y++) for (x = 0; x < n; x++) {
+        var cov = m[y * n + x]; if (cov <= 0.02) continue;
+        var aa = a * cov; if (aa >= 0.97) continue;
+        var base = B[0] + B[1] * x + B[2] * y;
+        var rec = (Y[(y0 + y) * stride + x0 + x] - aa * C) / (1 - aa);
+        var d = rec - base;
+        acc += d * d; cnt++;
+      }
+      if (!cnt) continue;
+      var r = acc / cnt;
+      if (r < bestR) { bestR = r; bestA = a; }
+    }
+    return bestA;
+  }
+
   global.UnsparkleCore = {
-    fitAt: fitAt, locateCorner: locateCorner,
+    fitAt: fitAt, locateCorner: locateCorner, refineAlpha: refineAlpha,
     SIZE_RATIO: SIZE_RATIO, MIN_EVIDENCE: 2.6,
     ALPHA: ALPHA, WHITE: WHITE, ALPHA_RGB: ALPHA_RGB,
     REF: {w: REF_W, h: REF_H, n: REF_N, insetRight: INSET_RIGHT, insetBottom: INSET_BOTTOM},
