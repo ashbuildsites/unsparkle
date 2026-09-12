@@ -209,6 +209,14 @@
       k = opts.alpha / ALPHA.y;
       if (k < 0.6) k = 0.6; else if (k > 2.4) k = 2.4;
     }
+    /*
+     * Chroma uses the same scaling as luma. Clamping it lower was tried, to
+     * curb the colour speckle a strong mark leaves in the half-resolution
+     * planes, and it simply swapped that speckle for a grey patch - the
+     * neutral cast of the watermark left behind. Neither is better, so keep
+     * the honest arithmetic.
+     */
+    var kc = k;
     var cx = g.x0 >> 1, cy = g.y0 >> 1, cn = n >> 1;
     var yStride = layout[0].stride, Y = buf.subarray(layout[0].offset);
     unblendPlane(Y, yStride, g.x0, g.y0, n, m, ALPHA.y * k, WHITE.y);
@@ -216,10 +224,10 @@
 
     if (fmt === "NV12" || fmt === "NV21") {
       var uv = buf.subarray(layout[1].offset);
-      unblendUVInterleaved(uv, layout[1].stride, cx, cy, cn, mc, k);
+      unblendUVInterleaved(uv, layout[1].stride, cx, cy, cn, mc, kc);
     } else if (layout.length >= 3) {
-      unblendPlane(buf.subarray(layout[1].offset), layout[1].stride, cx, cy, cn, mc, ALPHA.u * k, WHITE.u);
-      unblendPlane(buf.subarray(layout[2].offset), layout[2].stride, cx, cy, cn, mc, ALPHA.v * k, WHITE.v);
+      unblendPlane(buf.subarray(layout[1].offset), layout[1].stride, cx, cy, cn, mc, ALPHA.u * kc, WHITE.u);
+      unblendPlane(buf.subarray(layout[2].offset), layout[2].stride, cx, cy, cn, mc, ALPHA.v * kc, WHITE.v);
     }
     return g;
   }

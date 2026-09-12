@@ -106,27 +106,60 @@
    * frames and keeping the most convincing fit fixes that.
    */
   async function detectGeometry(d, W, H, wanted) {
+    var samples = d.vSamples, i;
+    wanted = wanted || 12;
+
     /*
-     * Sample only the opening of the clip. The mark is static, so early frames
-     * settle it - and spreading samples across the whole video forced a near
-     * complete extra decode, which made a 10s clip take 10s instead of 1s.
+     * Sample across the WHOLE clip, not just the opening.
+     *
+     * A 20-second video carried its watermark at the same spot throughout,
+     * but the first four seconds happened to sit over busy, low-contrast
+     * footage where it scored below threshold - so the tool reported nothing
+     * and returned the file untouched. Frames later in the same clip scored
+     * twice as high.
+     *
+     * Key frames decode independently, so when a clip has enough of them the
+     * whole timeline can be sampled for roughly the cost of decoding a dozen
+     * frames. Otherwise fall back to a bounded sequential pass.
      */
-    var samples = d.vSamples, picks = [], i;
-    var horizon = Math.min(samples.length, 120);
-    var stride = Math.max(1, Math.floor(horizon / (wanted || 7)));
-    for (i = 0; i < horizon && picks.length < (wanted || 7); i += stride) picks.push(i);
-    if (!picks.length) picks = [0];
+    var keys = [];
+    for (i = 0; i < samples.length; i++) if (samples[i].is_sync) keys.push(i);
+
+    /*
+     * Key-frame sampling only pays off when there are enough of them to cover
+     * the clip. With five, it yielded three usable readings whose spread was
+     * wider than the value being measured, and the median of three landed far
+     * enough off to over-correct. Below that, walk frames instead.
+     */
+    var plan = [], keyOnly = keys.length >= 8;
+    if (keyOnly) {
+      var kstep = Math.max(1, keys.length / wanted);
+      for (var k = 0; k < keys.length && plan.length < wanted; k += kstep)
+        plan.push(keys[Math.floor(k)]);
+    } else {
+      var horizon = Math.min(samples.length, 300);
+      var step = Math.max(1, Math.floor(horizon / wanted));
+      for (i = 0; i < horizon && plan.length < wanted; i += step) plan.push(i);
+    }
+    if (!plan.length) plan = [0];
 
     var results = [], buf = null, seen = 0, want = {};
-    for (i = 0; i < picks.length; i++) want[picks[i]] = true;
+    /*
+     * Keep the bottom-right corner of each sampled frame. Once the geometry
+     * is settled, opacity is re-measured at THAT spot on every sample - not
+     * only on the frames where it happened to win the search. A few hundred
+     * kilobytes buys a far steadier estimate.
+     */
+    var crops = [], cropW = Math.min(W, Math.round(W * 0.40)),
+        cropH = Math.min(H, Math.round(H * 0.30));
+    var cropX = W - cropW, cropY = H - cropH;
+    for (i = 0; i < plan.length; i++) want[plan[i]] = true;
 
-    // Frames arrive in decode order; only the sampled ones are worth the
-    // (expensive) corner search - searching all of them made this crawl.
     var chain = Promise.resolve();
     var dec = new VideoDecoder({
       output: function (frame) {
         var idx = seen++;
-        if (!want[idx]) { frame.close(); return; }
+        if (!keyOnly && !want[idx]) { frame.close(); return; }
         chain = chain.then(async function () {
           try {
             if (!buf || buf.length < frame.allocationSize())
@@ -135,10 +168,16 @@
             var yp = buf.subarray(layout[0].offset);
             var hit = Core.locateCorner(yp, W, H, layout[0].stride, Core.WHITE.y);
             if (hit) {
-              // residual-minimising opacity, not the biased analytic one
               hit.alpha = Core.refineAlpha(yp, W, H, layout[0].stride, hit,
                                            Core.WHITE.y, hit.alpha);
               results.push(hit);
+            }
+            if (crops.length < 16) {
+              var cp = new Uint8Array(cropW * cropH), st = layout[0].stride;
+              for (var cy = 0; cy < cropH; cy++)
+                cp.set(yp.subarray((cropY + cy) * st + cropX,
+                                   (cropY + cy) * st + cropX + cropW), cy * cropW);
+              crops.push(cp);
             }
           } catch (e) { /* a frame we cannot read tells us nothing */ }
           finally { frame.close(); }
@@ -151,70 +190,133 @@
                       description: d.videoDesc, hardwareAcceleration: "no-preference" });
     } catch (e) { return null; }
 
-    // Decode from the start up to the furthest sample we want.
-    var last = picks[picks.length - 1];
-    for (i = 0; i <= last && i < samples.length; i++) {
-      var sm = samples[i];
-      if (i === 0 && !sm.is_sync) break;
-      dec.decode(new EncodedVideoChunk({
-        type: sm.is_sync ? "key" : "delta",
-        timestamp: 1e6 * sm.cts / sm.timescale,
-        duration: 1e6 * sm.duration / sm.timescale,
-        data: sm.data
-      }));
-      if (i % 24 === 0) await new Promise(function (r) { setTimeout(r, 0); });
+    if (keyOnly) {
+      for (i = 0; i < plan.length; i++) {
+        var sk = samples[plan[i]];
+        dec.decode(new EncodedVideoChunk({
+          type: "key",
+          timestamp: 1e6 * sk.cts / sk.timescale,
+          duration: 1e6 * sk.duration / sk.timescale,
+          data: sk.data
+        }));
+        await new Promise(function (r) { setTimeout(r, 0); });
+      }
+    } else {
+      var last = plan[plan.length - 1];
+      for (i = 0; i <= last && i < samples.length; i++) {
+        var sm = samples[i];
+        if (i === 0 && !sm.is_sync) break;
+        dec.decode(new EncodedVideoChunk({
+          type: sm.is_sync ? "key" : "delta",
+          timestamp: 1e6 * sm.cts / sm.timescale,
+          duration: 1e6 * sm.duration / sm.timescale,
+          data: sm.data
+        }));
+        if (i % 24 === 0) await new Promise(function (r) { setTimeout(r, 0); });
+      }
     }
     try { await dec.flush(); } catch (e) {}
-    try { await chain; } catch (e) {}        // the sampled searches finish here
+    try { await chain; } catch (e) {}
     try { dec.close(); } catch (e) {}
     if (!results.length) return null;
 
     /*
-     * Keep the strongest placement, then choose the opacity from the frames
-     * where it can actually be measured.
+     * Agreement across frames is the real signal.
      *
-     * The estimate divides by (white - background), so a bright background
-     * makes it unreliable: on one clip the same constant mark read 0.43 over
-     * a mid-grey wall and 0.04 over a bright one. Ranking frames by contrast
-     * and taking the median of the better half avoids being dragged around by
-     * the frames that had nothing to measure against.
+     * A genuine watermark lands on the same few pixels in every frame it is
+     * measured; a meaningless fit wanders. Clustering on position lets a
+     * modest per-frame score still be believed when it recurs, and stops a
+     * single lucky frame from carrying the decision on its own.
      */
-    var best = null;
+    var clusters = [];
     for (i = 0; i < results.length; i++) {
-      if (!best || results[i].evidence > best.evidence) best = results[i];
+      var r = results[i], placed = false;
+      for (var c = 0; c < clusters.length; c++) {
+        var h = clusters[c].hits[0];
+        var tolp = Math.max(8, h.n * 0.18);
+        if (Math.abs(r.x0 - h.x0) <= tolp && Math.abs(r.y0 - h.y0) <= tolp &&
+            Math.abs(r.n - h.n) <= Math.max(8, h.n * 0.2)) {
+          clusters[c].hits.push(r); placed = true; break;
+        }
+      }
+      if (!placed) clusters.push({ hits: [r] });
     }
-    var near = results.filter(function (r) {
-      return Math.abs(r.n - best.n) <= 6 &&
-             Math.abs(r.x0 - best.x0) <= 8 && Math.abs(r.y0 - best.y0) <= 8;
+    clusters.forEach(function (c) {
+      c.best = c.hits.reduce(function (a, b) { return b.evidence > a.evidence ? b : a; });
+      c.count = c.hits.length;
+      // recurrence counts for as much as a single strong reading
+      c.score = c.best.evidence + (c.count - 1) * 1.2;
     });
+    clusters.sort(function (a, b) { return b.score - a.score; });
+    var win = clusters[0];
+
+    var best = win.best;
+    best.samples = results.length;
+    best.agreed = win.count;
+    best.clusterScore = win.score;
+
     /*
-     * Choose the opacity, but only from frames where it can be measured.
+     * Re-measure opacity at the settled geometry on every sampled frame, then
+     * take a low percentile.
      *
-     * The estimate divides by (white - background), so over a pale background
-     * it is close to dividing by nothing. One clip whose mark sits on cream
-     * fabric fitted an opacity high enough to gouge a dark hole in the frame.
-     * Frames without real contrast are discarded, and if none survive the
-     * measured constant is used instead of a guess.
-     *
-     * Among the frames that do qualify, the lower third is taken rather than
-     * the median. The two failure modes are not symmetric: under-correcting
-     * leaves a faint ghost most people never notice, over-correcting leaves a
-     * dark star-shaped smudge that is worse than not running the tool at all.
+     * The opacity of a given watermark is constant, but the per-frame
+     * estimate is not: a plane cannot describe a busy background, which
+     * biases the fit. On one clip the per-frame optima ranged 0.31 to 0.46,
+     * and using the strongest frame's 0.41 burned a dark star into the parts
+     * of the clip that wanted 0.31. Under-correcting leaves a faint trace
+     * nobody notices; over-correcting is glaring. So take the low end.
      */
-    var MIN_CONTRAST = 45;
-    var usable = near.filter(function (r) { return (r.contrast || 0) >= MIN_CONTRAST; });
-    if (usable.length) {
-      var keep = usable.map(function (r) { return r.alpha; })
-                       .sort(function (a, b) { return a - b; });
-      best.alpha = keep[Math.floor(keep.length / 3)];
-    } else {
-      best.alpha = Core.ALPHA.y;          // too little contrast to measure
+    var geomFixed = { x0: best.x0 - cropX, y0: best.y0 - cropY, n: best.n };
+    var strong = [], weak = [];
+    if (geomFixed.x0 >= 0 && geomFixed.y0 >= 0 &&
+        geomFixed.x0 + best.n <= cropW && geomFixed.y0 + best.n <= cropH) {
+      for (i = 0; i < crops.length; i++) {
+        var fr = Core.fitAt(crops[i], cropW, cropH, cropW, geomFixed.x0, geomFixed.y0,
+                            best.n, Core.matteAt(best.n), Core.WHITE.y);
+        if (!fr) continue;
+        var ra = Core.refineAlpha(crops[i], cropW, cropH, cropW, geomFixed,
+                                  Core.WHITE.y, fr.a);
+        if (!(ra > 0.12 && ra < 0.78)) continue;
+        if ((fr.contrast || 0) >= 45) strong.push(ra); else weak.push(ra);
+      }
+    }
+    /*
+     * When the readings disagree badly there is no good central value, so
+     * lean low - a faint leftover beats a dark smear.
+     */
+    /*
+     * Median of the per-frame fits, not a low percentile.
+     *
+     * A low percentile was tried to guard against over-correction and broke
+     * the opposite case: one clip whose mark really is at 0.69 was dragged
+     * down to 0.30 and came back with the watermark still plainly visible.
+     * Across every clip measured, the median lands within a few hundredths of
+     * the truth while the outliers - frames whose background a plane cannot
+     * describe - sit at the tails where they belong.
+     *
+     * Frames with real contrast are preferred, but if too few have it, a
+     * reading from a washed-out frame still beats falling back to a constant
+     * that may be half the real value.
+     */
+    var pool = strong.length >= 2 ? strong : strong.concat(weak);
+    if (pool.length >= 2) {
+      pool.sort(function (a, b) { return a - b; });
+      var spread = pool[pool.length - 1] - pool[0];
+      var idx = (spread > 0.25 && pool.length >= 4)
+        ? Math.floor(pool.length * 0.35)      // readings disagree: lean low
+        : (pool.length >> 1);                 // they agree: the median is sound
+      best.alpha = pool[idx];
+      best.alphaSamples = pool.length;
+      best.alphaSpread = spread;
+    } else if (pool.length === 1) {
+      best.alpha = pool[0];
+      best.alphaSamples = 1;
+    } else if ((best.contrast || 0) < 45) {
+      best.alpha = Core.ALPHA.y;
       best.lowContrast = true;
     }
     if (best.alpha < 0.15) best.alpha = 0.15;
     if (best.alpha > 0.75) best.alpha = 0.75;
-    best.samples = results.length;
-    best.agreed = near.length;
     return best;
   }
 
@@ -364,8 +466,18 @@
     var processed = 0;
 
     report(10, "checking");
-    var hit = await detectGeometry(d, W, H, 7);
-    if (!hit || hit.evidence < Core.MIN_EVIDENCE) {
+    var hit = await detectGeometry(d, W, H, 12);
+    /*
+     * Believe it when several frames agree on the same spot, or when one
+     * frame is emphatic on its own. Recurrence is what separates a real mark
+     * from a lucky fit, so a lower per-frame score is acceptable if it
+     * repeats in the same place across the clip.
+     */
+    var convincing = hit && (
+      (hit.agreed >= 3 && hit.evidence >= 3.4) ||
+      (hit.agreed >= 2 && hit.evidence >= 4.4) ||
+      hit.evidence >= Core.MIN_EVIDENCE + 1.0);
+    if (!convincing) {
       detection = { found: false, evidence: hit ? hit.evidence : 0 };
       geom = false;                             // nothing convincing: leave it alone
     } else {
@@ -516,6 +628,8 @@
         hasAudio: !!(d.audio && d.aSamples.length),
         found: !!(detection && detection.found),
         evidence: detection ? detection.evidence : 0,
+        agreed: detection ? (detection.agreed || 0) : 0,
+        samples: detection ? (detection.samples || 0) : 0,
         alpha: detection ? detection.alpha : 0,
         encoderConfig: encCfg.codec + " / " + encCfg.latencyMode + " / " + encCfg.hardwareAcceleration,
         geom: (geom && geom !== false) ? geom : Core.geometry(W, H)
